@@ -1,0 +1,3 @@
+﻿  csamplecontrollerdriver.cpp
+C:\Users\ambkh\Downloads\OpenVR-driver-for-DIY-master\OpenVR-driver-for-DIY-master\OpenVR\samples\driver_sample\csamplecontrollerdriver.cpp(388): warning C4715: 'CSampleControllerDriver::GetSerialNumber': not all control paths return a value
+  driver_sample.vcxproj -> C:\Users\ambkh\Downloads\OpenVR-driver-for-DIY-master\OpenVR-driver-for-DIY-master\OpenVR\samples\driver_sample\bin\drivers\sample\bin\win64\driver_sample.dll

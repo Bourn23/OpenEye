@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "openvr-controller": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "env": {},
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

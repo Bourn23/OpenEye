@@ -1,0 +1,4 @@
+# Requirements for Gemini VR Agent
+google-genai>=1.0.0
+mcp
+pillow

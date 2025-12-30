@@ -1,0 +1,16 @@
+﻿  basics.cpp
+  cframecapture.cpp
+  cposedatareceiver.cpp
+  csamplecontrollerdriver.cpp
+  csampledevicedriver.cpp
+  cserverdriver_sample.cpp
+  ctcpclient.cpp
+  cvisionserver.cpp
+  cwatchdogdriver_sample.cpp
+  driverlog.cpp
+  driver_sample.cpp
+  jpge.cpp
+  Generating Code...
+D:\Projects\Tiger_wood\OpenVR\samples\driver_sample\csamplecontrollerdriver.cpp(328,1): warning C4715: 'CSampleControllerDriver::GetSerialNumber': not all control paths return a value
+     Creating library D:\Projects\Tiger_wood\OpenVR\samples\driver_sample\\bin\drivers\sample\bin\win64\driver_sample.lib and object D:\Projects\Tiger_wood\OpenVR\samples\driver_sample\\bin\drivers\sample\bin\win64\driver_sample.exp
+  driver_sample.vcxproj -> D:\Projects\Tiger_wood\OpenVR\samples\driver_sample\bin\drivers\sample\bin\win64\driver_sample.dll

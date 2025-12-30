@@ -1,0 +1,19 @@
+{
+   "driver_null" : {
+      "enable" : true,
+      "id" : "Sample Driver",
+      "renderWidth" : 800,
+      "renderHeight" : 1600,
+      "secondsFromVsyncToPhotons" : 0.10000000149011612,
+      "displayFrequency" : 60.0,
+      "serialNumber" : "Sample 4711",
+      "windowHeight" : 800,
+      "windowWidth" : 1600,
+      "windowX" : 0,
+      "windowY" : 0,
+      "tcpEnabled" : true,
+      "tcpHost" : "127.0.0.1",
+      "tcpPort" : 5555,
+      "visionEnabled" : true
+   }
+}
