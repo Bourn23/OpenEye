@@ -161,23 +161,41 @@ def handle_client(client_socket: socket.socket):
     while True:
         try:
             client_socket.settimeout(2.0)
-            data = client_socket.recv(65536)  # Larger buffer for vision data
+            data = client_socket.recv(5242880)  # 5MB buffer for large vision data
             if not data: break
             
             buffer += data.decode('utf-8')
             
-            # Process complete JSON messages
+            # Process complete JSON messages (newline-delimited)
+            # For large vision responses, we need to ensure we have complete JSON
             while '\n' in buffer:
-                line, buffer = buffer.split('\n', 1)
+                newline_pos = buffer.find('\n')
+                line = buffer[:newline_pos]
+                
                 if line.strip():
+                    # Try to parse as JSON - if it fails, the message might be incomplete
+                    # This can happen if the base64 data contains characters that look like newlines
                     try:
                         msg = json.loads(line)
+                        # Successfully parsed - remove from buffer and process
+                        buffer = buffer[newline_pos + 1:]
+                        
                         # Check if this is a vision response
                         if msg.get('type') in ['frame', 'video', 'status', 'error']:
                             vision_response = msg
                             vision_event.set()
                     except json.JSONDecodeError:
-                        pass
+                        # JSON incomplete - might be a partial vision response
+                        # Check if this looks like a vision response (has "frames" field)
+                        if '"frames"' in line or '"type":"frame"' in line or '"type":"video"' in line:
+                            # This is likely a truncated vision response - wait for more data
+                            break
+                        else:
+                            # Not a vision response, just bad JSON - skip it
+                            buffer = buffer[newline_pos + 1:]
+                else:
+                    # Empty line, skip it
+                    buffer = buffer[newline_pos + 1:]
                         
         except socket.timeout:
             continue

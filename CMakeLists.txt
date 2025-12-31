@@ -1,6 +1,6 @@
 include_directories(../../headers)
 
-set(TARGET_NAME driver_sample)
+set(TARGET_NAME driver_null)
 
 add_library(${TARGET_NAME} MODULE
   basics.cpp

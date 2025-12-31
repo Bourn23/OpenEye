@@ -29,6 +29,8 @@ int GetAsyncKeyState(int key);
 #define VK_PRIOR   0x80012
 #define VK_NEXT    0x80013
 #define VK_END     0x80014
+#define VK_SHIFT   0x10
+#define VK_F10     0x79
 #endif
 
 // keys for use with the settings API

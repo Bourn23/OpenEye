@@ -153,16 +153,12 @@ void CSampleDeviceDriver::GetRecommendedRenderTargetSize(uint32_t* pnWidth, uint
 }
 
 void CSampleDeviceDriver::GetEyeOutputViewport(EVREye eEye, uint32_t* pnX, uint32_t* pnY, uint32_t* pnWidth, uint32_t* pnHeight) {
+    // Single screen mode: both eyes see the full window (no stereo split)
+    // This gives a single unified view covering both eyes' field of vision
+    *pnX = 0;
     *pnY = 0;
-    *pnWidth = m_nWindowWidth / 2;
+    *pnWidth = m_nWindowWidth;
     *pnHeight = m_nWindowHeight;
-
-    if (eEye == Eye_Left) {
-        *pnX = 0;
-    }
-    else {
-        *pnX = m_nWindowWidth / 2;
-    }
 }
 
 void CSampleDeviceDriver::GetProjectionRaw(EVREye eEye, float* pfLeft, float* pfRight, float* pfTop, float* pfBottom) {

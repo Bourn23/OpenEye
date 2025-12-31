@@ -18,6 +18,10 @@ static double c2pX = 0, c2pY = 0, c2pZ = 0;
 static ControllerInput ctrl1Input;
 static ControllerInput ctrl2Input;
 
+// Keyboard input toggle - disabled by default, enabled with Shift+F10
+static bool g_keyboardInputEnabled = false;
+static bool g_toggleKeyWasPressed = false;
+
 struct Quaternion {
     double w, x, y, z;
 };
@@ -255,9 +259,22 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
 void CSampleControllerDriver::RunFrame() {
     ControllerInput* input = (ControllerIndex == 1) ? &ctrl1Input : &ctrl2Input;
     
+    // Check for Shift+F10 toggle (only check once per frame, on controller 1)
     if (ControllerIndex == 1) {
-        // Use TCP input if available, otherwise fall back to keyboard
-        bool useKeyboard = !input->inputUpdated;
+        bool shiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool f10Pressed = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+        bool toggleKeyPressed = shiftPressed && f10Pressed;
+        
+        if (toggleKeyPressed && !g_toggleKeyWasPressed) {
+            g_keyboardInputEnabled = !g_keyboardInputEnabled;
+            DriverLog("Keyboard input %s (Shift+F10)\n", g_keyboardInputEnabled ? "ENABLED" : "DISABLED");
+        }
+        g_toggleKeyWasPressed = toggleKeyPressed;
+    }
+    
+    if (ControllerIndex == 1) {
+        // Use TCP input if available, otherwise fall back to keyboard (only if enabled)
+        bool useKeyboard = !input->inputUpdated && g_keyboardInputEnabled;
         
         // Buttons - TCP input OR keyboard fallback
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[0], 
@@ -277,14 +294,15 @@ void CSampleControllerDriver::RunFrame() {
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[14], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('G')) != 0) : input->trackpadTouch, 0);
 
-        // D-pad (keyboard only for now)
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[3], (0x8000 & GetAsyncKeyState('R')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[4], (0x8000 & GetAsyncKeyState('T')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[5], (0x8000 & GetAsyncKeyState('Y')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], (0x8000 & GetAsyncKeyState('U')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], (0x8000 & GetAsyncKeyState('P')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], (0x8000 & GetAsyncKeyState('A')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], (0x8000 & GetAsyncKeyState('D')) != 0, 0);
+        // D-pad (keyboard only for now, respects toggle)
+        bool dpadEnabled = g_keyboardInputEnabled;
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[3], dpadEnabled && (0x8000 & GetAsyncKeyState('R')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[4], dpadEnabled && (0x8000 & GetAsyncKeyState('T')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[5], dpadEnabled && (0x8000 & GetAsyncKeyState('Y')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], dpadEnabled && (0x8000 & GetAsyncKeyState('U')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], dpadEnabled && (0x8000 & GetAsyncKeyState('P')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], dpadEnabled && (0x8000 & GetAsyncKeyState('A')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('D')) != 0, 0);
 
         // Analog inputs - TCP or keyboard
         if (useKeyboard) {
@@ -303,7 +321,7 @@ void CSampleControllerDriver::RunFrame() {
         }
     } else {
         // Controller2
-        bool useKeyboard = !input->inputUpdated;
+        bool useKeyboard = !input->inputUpdated && g_keyboardInputEnabled;
         
         // Buttons - TCP input OR keyboard fallback
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[0], 
@@ -323,14 +341,15 @@ void CSampleControllerDriver::RunFrame() {
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[14], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('4')) != 0) : input->trackpadTouch, 0);
 
-        // D-pad (keyboard only)
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[3], (0x8000 & GetAsyncKeyState('L')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[4], (0x8000 & GetAsyncKeyState('Z')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[5], (0x8000 & GetAsyncKeyState('X')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], (0x8000 & GetAsyncKeyState('C')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], (0x8000 & GetAsyncKeyState('N')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], (0x8000 & GetAsyncKeyState('M')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], (0x8000 & GetAsyncKeyState('2')) != 0, 0);
+        // D-pad (keyboard only, respects toggle)
+        bool dpadEnabled = g_keyboardInputEnabled;
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[3], dpadEnabled && (0x8000 & GetAsyncKeyState('L')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[4], dpadEnabled && (0x8000 & GetAsyncKeyState('Z')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[5], dpadEnabled && (0x8000 & GetAsyncKeyState('X')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], dpadEnabled && (0x8000 & GetAsyncKeyState('C')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], dpadEnabled && (0x8000 & GetAsyncKeyState('N')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], dpadEnabled && (0x8000 & GetAsyncKeyState('M')) != 0, 0);
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('2')) != 0, 0);
 
         // Analog inputs
         if (useKeyboard) {

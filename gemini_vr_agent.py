@@ -23,6 +23,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, rely on system env vars
+
 # Try the new google-genai package first, fall back to deprecated one
 try:
     from google import genai
@@ -30,13 +37,8 @@ try:
     USE_NEW_SDK = True
     print("[DEBUG] Using new google-genai SDK")
 except ImportError:
-    try:
-        import google.generativeai as genai_old
-        USE_NEW_SDK = False
-        print("[DEBUG] Using deprecated google.generativeai SDK")
-    except ImportError:
-        print("Please install google-genai: pip install google-genai")
-        exit(1)
+    print("Please install google-genai: pip install google-genai")
+    exit(1)
 
 # ============================================================================
 # Configuration
@@ -46,11 +48,26 @@ GEMINI_MODEL = "gemini-3-flash-preview"  # or "gemini-1.5-pro" for better reason
 DEBUG = True  # Enable debug output
 LOG_DIR = Path("agent_logs")  # Directory for log files
 SAVE_VISION_FRAMES = True  # Save captured images to disk for inspection
+SHOW_VISION_PREVIEW = True  # Show real-time vision preview with cv2.imshow
 
 # Rate limiting configuration
 MAX_REQUESTS_PER_MINUTE = 35  # Stay under 40 RPM limit with buffer
 MIN_REQUEST_INTERVAL = 2.0  # Minimum seconds between requests (spreads out calls)
 MAX_CONCURRENT_REQUESTS = 6  # Stay under 8 concurrent limit with buffer
+
+# Response configuration
+MAX_OUTPUT_TOKENS = 2048  # Limit response length to prevent rambling
+API_TIMEOUT_MS = 60000  # 60 second timeout for API calls
+
+# Try to import OpenCV for vision preview
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    if SHOW_VISION_PREVIEW:
+        print("[WARNING] OpenCV not installed. Run: pip install opencv-python")
 
 # ============================================================================
 # Rate Limiter
@@ -192,10 +209,13 @@ class AgentLogger:
         # Create session-specific log file
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = self.log_dir / f"agent_session_{self.session_id}.log"
+        self.llm_log_file = self.log_dir / f"llm_conversation_{self.session_id}.log"
         self.vision_dir = self.log_dir / f"vision_{self.session_id}"
+        self.media_dir = self.log_dir / f"media_{self.session_id}"
         
-        if SAVE_VISION_FRAMES:
-            self.vision_dir.mkdir(exist_ok=True)
+        # Always create vision and media directories
+        self.vision_dir.mkdir(exist_ok=True)
+        self.media_dir.mkdir(exist_ok=True)
         
         # Setup file logger
         self.file_logger = logging.getLogger(f"vr_agent_{self.session_id}")
@@ -205,10 +225,19 @@ class AgentLogger:
         file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
         self.file_logger.addHandler(file_handler)
         
+        # Setup dedicated LLM conversation logger
+        self.llm_logger = logging.getLogger(f"llm_conv_{self.session_id}")
+        self.llm_logger.setLevel(logging.DEBUG)
+        
+        llm_handler = logging.FileHandler(self.llm_log_file, encoding='utf-8')
+        llm_handler.setFormatter(logging.Formatter('%(message)s'))
+        self.llm_logger.addHandler(llm_handler)
+        
         # Counters
         self.action_count = 0
         self.vision_frame_count = 0
         self.api_call_count = 0
+        self.llm_message_count = 0
         
         self._log_header()
     
@@ -219,11 +248,25 @@ class AgentLogger:
 VR AGENT SESSION: {self.session_id}
 Started: {datetime.now().isoformat()}
 Log File: {self.log_file}
-Vision Frames: {self.vision_dir if SAVE_VISION_FRAMES else 'Disabled'}
+LLM Conversation Log: {self.llm_log_file}
+Vision Frames: {self.vision_dir}
+Media Files: {self.media_dir}
 {'='*70}
 """
         print(header)
         self.file_logger.info(header)
+        
+        # LLM log header
+        llm_header = f"""{'='*80}
+LLM CONVERSATION LOG - Session: {self.session_id}
+Started: {datetime.now().isoformat()}
+{'='*80}
+
+This log contains all messages sent to and received from the LLM.
+Media files are saved to: {self.media_dir}
+{'='*80}
+"""
+        self.llm_logger.info(llm_header)
     
     def _format_and_log(self, level: str, category: str, message: str, data: Dict = None):
         """Format and output log entry."""
@@ -252,7 +295,7 @@ Vision Frames: {self.vision_dir if SAVE_VISION_FRAMES else 'Disabled'}
             data_str = json.dumps(data, indent=2, default=str)
             # Truncate large data for console
             if len(data_str) > 500:
-                print(f"  └─ Data: {data_str[:500]}... (truncated)")
+                print(f"  └─ Data: {data_str[700:]}... (truncated)")
             else:
                 for line in data_str.split('\n'):
                     print(f"  │ {line}")
@@ -280,43 +323,323 @@ Vision Frames: {self.vision_dir if SAVE_VISION_FRAMES else 'Disabled'}
             {"arguments": args}
         )
         
-        # Handle vision results specially
-        if is_vision and "base64" in result.lower():
+        # Handle vision results specially - check for image data patterns
+        if is_vision and ('"data"' in result or '"type": "image"' in result or '"type": "panorama_scan"' in result):
             self._handle_vision_result(tool_name, result)
         else:
             # Truncate long results for display
             display_result = result[:300] + "..." if len(result) > 300 else result
             self._format_and_log("ACTION", "RESULT", display_result)
     
-    def _handle_vision_result(self, tool_name: str, result: str):
-        """Handle and optionally save vision data."""
-        self.vision_frame_count += 1
+    def _show_image_preview(self, img_data: bytes, title: str):
+        """Show image preview using OpenCV if available and enabled."""
+        if not SHOW_VISION_PREVIEW or not CV2_AVAILABLE:
+            return
         
-        # Try to extract and save base64 image
-        if SAVE_VISION_FRAMES:
+        try:
+            # Validate JPEG data before decoding
+            if len(img_data) < 100:
+                self._format_and_log("VISION", "PREVIEW", f"Image data too small ({len(img_data)} bytes), skipping preview")
+                return
+            
+            # Check JPEG header (FFD8) and footer (FFD9)
+            if img_data[:2] != b'\xff\xd8':
+                self._format_and_log("VISION", "PREVIEW", "Invalid JPEG header, skipping preview")
+                return
+            
+            if img_data[-2:] != b'\xff\xd9':
+                self._format_and_log("VISION", "PREVIEW", f"JPEG data appears truncated (missing FFD9 footer, size={len(img_data)}), skipping preview")
+                return
+            
+            # Decode JPEG bytes to numpy array
+            nparr = np.frombuffer(img_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is not None:
+                # Resize if too large (max 800px width for preview)
+                h, w = img.shape[:2]
+                if w > 800:
+                    scale = 800 / w
+                    img = cv2.resize(img, (800, int(h * scale)))
+                
+                cv2.imshow(title, img)
+                cv2.waitKey(500)  # Show for 500ms minimum
+            else:
+                self._format_and_log("VISION", "PREVIEW", "cv2.imdecode returned None - JPEG may be corrupt")
+        except Exception as e:
+            self._format_and_log("VISION", "PREVIEW", f"Failed to show preview: {e}")
+    
+    def _handle_vision_result(self, tool_name: str, result: str):
+        """Handle and optionally save vision data from various vision tools."""
+        
+        try:
+            # Try to parse as JSON first
+            result_data = None
             try:
-                # Look for base64 data in result
-                import re
-                b64_match = re.search(r'[A-Za-z0-9+/=]{100,}', result)
-                if b64_match:
-                    b64_data = b64_match.group(0)
-                    img_data = base64.b64decode(b64_data)
+                result_data = json.loads(result)
+            except json.JSONDecodeError:
+                pass
+            
+            if not isinstance(result_data, dict):
+                self._format_and_log("VISION", "CAPTURE", f"Vision data received ({len(result)} chars) - could not parse JSON")
+                return
+            
+            result_type = result_data.get('type', '')
+            
+            # Handle panorama scan (look_around_and_observe) - multiple directions
+            if result_type == 'panorama_scan' and 'directions' in result_data:
+                directions = result_data['directions']
+                preview_images = []
+                
+                for direction in directions:
+                    angle = direction.get('angle', 0)
+                    b64_data = direction.get('data')
+                    if b64_data:
+                        self._save_and_show_frame(b64_data, f"{tool_name}_angle{angle}", f"VR Vision - {angle} deg")
+                        
+                        # Collect for combined preview
+                        if SHOW_VISION_PREVIEW and CV2_AVAILABLE:
+                            try:
+                                img_data = base64.b64decode(b64_data)
+                                nparr = np.frombuffer(img_data, np.uint8)
+                                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                                if img is not None:
+                                    preview_images.append((angle, img))
+                            except:
+                                pass
+                
+                # Create combined panorama preview (2x2 grid)
+                self._show_panorama_grid(preview_images)
+                return
+            
+            # Handle video (capture_video) - multiple frames
+            if result_type == 'video' and 'frames' in result_data:
+                frames = result_data['frames']
+                fps = result_data.get('fps', 10)
+                
+                for i, b64_data in enumerate(frames):
+                    self._save_and_show_frame(b64_data, f"{tool_name}_frame{i:03d}", f"VR Video - Frame {i}")
                     
-                    frame_path = self.vision_dir / f"frame_{self.vision_frame_count:04d}_{tool_name}.jpg"
-                    frame_path.write_bytes(img_data)
-                    
-                    self._format_and_log(
-                        "VISION",
-                        f"FRAME #{self.vision_frame_count}",
-                        f"Saved to: {frame_path}",
-                        {"size_bytes": len(img_data)}
-                    )
+                    # Brief delay between frames for video preview effect
+                    if SHOW_VISION_PREVIEW and CV2_AVAILABLE and i < len(frames) - 1:
+                        cv2.waitKey(int(1000 / fps))
+                return
+            
+            # Handle single image (inspect_surroundings) - direct data field
+            if result_type == 'image' and 'data' in result_data:
+                b64_data = result_data['data']
+                self._save_and_show_frame(b64_data, tool_name, f"VR Vision - {tool_name}")
+                return
+            
+            # Fallback: try to find any 'data' field with base64
+            if 'data' in result_data:
+                self._save_and_show_frame(result_data['data'], tool_name, f"VR Vision - {tool_name}")
+                return
+            
+            self._format_and_log("VISION", "CAPTURE", f"Vision data received but format not recognized: type={result_type}")
+            
+        except Exception as e:
+            self._format_and_log("VISION", "ERROR", f"Failed to process vision data: {e}")
+    
+    def _save_and_show_frame(self, b64_data: str, name_suffix: str, window_title: str):
+        """Decode, save, and optionally display a single base64 frame."""
+        try:
+            img_data = base64.b64decode(b64_data)
+            self.vision_frame_count += 1
+            timestamp = datetime.now().strftime("%H%M%S")
+            frame_path = self.vision_dir / f"frame_{self.vision_frame_count:04d}_{timestamp}_{name_suffix}.jpg"
+            frame_path.write_bytes(img_data)
+            
+            self._format_and_log(
+                "VISION",
+                f"FRAME #{self.vision_frame_count}",
+                f"Saved to: {frame_path}",
+                {"size_bytes": len(img_data)}
+            )
+            
+            # Show preview
+            self._show_image_preview(img_data, window_title)
+            
+        except Exception as e:
+            self._format_and_log("VISION", "ERROR", f"Failed to save frame {name_suffix}: {e}")
+    
+    def _show_panorama_grid(self, preview_images: list):
+        """Create and show a 2x2 grid of panorama images."""
+        if not SHOW_VISION_PREVIEW or not CV2_AVAILABLE or len(preview_images) < 4:
+            return
+        
+        try:
+            # Sort by angle and resize to same size
+            preview_images.sort(key=lambda x: x[0])
+            target_h, target_w = 240, 320
+            resized = [cv2.resize(img, (target_w, target_h)) for _, img in preview_images[:4]]
+            
+            # Create 2x2 grid
+            top_row = np.hstack([resized[0], resized[1]])
+            bottom_row = np.hstack([resized[2], resized[3]])
+            combined = np.vstack([top_row, bottom_row])
+            
+            # Add angle labels
+            angles = [0, 90, 180, 270]
+            positions = [(10, 30), (target_w + 10, 30), (10, target_h + 30), (target_w + 10, target_h + 30)]
+            for angle, pos in zip(angles, positions):
+                cv2.putText(combined, f"{angle} deg", pos, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            cv2.imshow("VR Vision - 360 Panorama", combined)
+            cv2.waitKey(2000)
+        except Exception as e:
+            self._format_and_log("VISION", "PREVIEW", f"Failed to create panorama grid: {e}")
+    
+    def save_media(self, data: bytes, media_type: str, source: str) -> Path:
+        """Save any media data (images, etc.) and return the path."""
+        timestamp = datetime.now().strftime("%H%M%S_%f")
+        
+        # Determine extension based on type
+        ext_map = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "jpeg": ".jpg",
+            "png": ".png",
+        }
+        ext = ext_map.get(media_type.lower(), ".bin")
+        
+        filename = f"{source}_{timestamp}{ext}"
+        filepath = self.media_dir / filename
+        filepath.write_bytes(data)
+        
+        self._format_and_log("INFO", "MEDIA", f"Saved: {filepath} ({len(data)} bytes)")
+        return filepath
+    
+    def log_llm_request(self, contents: List, iteration: int):
+        """Log the full request being sent to the LLM."""
+        self.llm_message_count += 1
+        
+        separator = f"\n{'='*80}\n"
+        header = f"{separator}[REQUEST #{self.llm_message_count}] Iteration {iteration} - {datetime.now().isoformat()}{separator}"
+        self.llm_logger.info(header)
+        
+        for i, content in enumerate(contents):
+            role = getattr(content, 'role', 'unknown')
+            self.llm_logger.info(f"\n--- Message {i+1} (role: {role}) ---")
+            
+            parts = getattr(content, 'parts', [])
+            for j, part in enumerate(parts):
+                # Handle different part types
+                if hasattr(part, 'text') and part.text:
+                    text = part.text
+                    # Truncate very long text but note the full length
+                    if len(text) > 2000:
+                        self.llm_logger.info(f"[Part {j+1} - TEXT ({len(text)} chars, truncated)]")
+                        self.llm_logger.info(text[:2000] + "\n... [TRUNCATED]")
+                    else:
+                        self.llm_logger.info(f"[Part {j+1} - TEXT]")
+                        self.llm_logger.info(text)
+                
+                elif hasattr(part, 'function_call') and part.function_call:
+                    fc = part.function_call
+                    self.llm_logger.info(f"[Part {j+1} - FUNCTION_CALL]")
+                    self.llm_logger.info(f"  Function: {fc.name}")
+                    self.llm_logger.info(f"  Args: {dict(fc.args) if fc.args else {}}")
+                
+                elif hasattr(part, 'function_response') and part.function_response:
+                    fr = part.function_response
+                    self.llm_logger.info(f"[Part {j+1} - FUNCTION_RESPONSE]")
+                    self.llm_logger.info(f"  Function: {fr.name}")
+                    response_str = str(fr.response)
+                    # Check for base64 data and save it
+                    if len(response_str) > 1000 and 'base64' in response_str.lower():
+                        self.llm_logger.info(f"  Response: [Contains base64 data, {len(response_str)} chars - see media folder]")
+                        self._save_base64_from_response(response_str, fr.name)
+                    elif len(response_str) > 2000:
+                        self.llm_logger.info(f"  Response ({len(response_str)} chars, truncated): {response_str[:2000]}...")
+                    else:
+                        self.llm_logger.info(f"  Response: {response_str}")
+                
+                elif hasattr(part, 'inline_data') and part.inline_data:
+                    # Handle inline media
+                    inline = part.inline_data
+                    mime = getattr(inline, 'mime_type', 'unknown')
+                    data = getattr(inline, 'data', b'')
+                    self.llm_logger.info(f"[Part {j+1} - INLINE_DATA]")
+                    self.llm_logger.info(f"  MIME: {mime}, Size: {len(data)} bytes")
+                    # Save the media
+                    if data:
+                        self.save_media(data if isinstance(data, bytes) else base64.b64decode(data), mime, f"inline_{i}_{j}")
+                
                 else:
-                    self._format_and_log("VISION", "CAPTURE", f"Vision data received ({len(result)} chars)")
-            except Exception as e:
-                self._format_and_log("VISION", "CAPTURE", f"Vision data received (save failed: {e})")
-        else:
-            self._format_and_log("VISION", "CAPTURE", f"Vision data received ({len(result)} chars)")
+                    self.llm_logger.info(f"[Part {j+1} - OTHER: {type(part).__name__}]")
+    
+    def _save_base64_from_response(self, response_str: str, source: str):
+        """Extract and save base64 data from a response string."""
+        try:
+            # Try to parse as JSON first
+            try:
+                result_data = json.loads(response_str)
+                if isinstance(result_data, dict):
+                    # Check for nested 'result' key
+                    if 'result' in result_data:
+                        inner = result_data['result']
+                        if isinstance(inner, str):
+                            try:
+                                inner = json.loads(inner)
+                            except:
+                                pass
+                        if isinstance(inner, dict) and 'data' in inner:
+                            b64_data = inner['data']
+                            img_data = base64.b64decode(b64_data)
+                            self.save_media(img_data, "jpeg", f"response_{source}")
+                            return
+                    # Check for direct 'data' key
+                    if 'data' in result_data:
+                        b64_data = result_data['data']
+                        img_data = base64.b64decode(b64_data)
+                        self.save_media(img_data, "jpeg", f"response_{source}")
+                        return
+            except json.JSONDecodeError:
+                pass
+            
+            # Fall back to regex
+            import re
+            b64_match = re.search(r'"data"\s*:\s*"([A-Za-z0-9+/=]+)"', response_str)
+            if b64_match:
+                b64_data = b64_match.group(1)
+                img_data = base64.b64decode(b64_data)
+                self.save_media(img_data, "jpeg", f"response_{source}")
+        except Exception as e:
+            self.llm_logger.info(f"  [Failed to extract/save base64: {e}]")
+    
+    def log_llm_response(self, response, iteration: int):
+        """Log the full response received from the LLM."""
+        separator = f"\n{'-'*80}\n"
+        header = f"{separator}[RESPONSE] Iteration {iteration} - {datetime.now().isoformat()}{separator}"
+        self.llm_logger.info(header)
+        
+        for i, candidate in enumerate(response.candidates):
+            self.llm_logger.info(f"\n--- Candidate {i+1} ---")
+            
+            content = candidate.content
+            role = getattr(content, 'role', 'unknown')
+            self.llm_logger.info(f"Role: {role}")
+            
+            for j, part in enumerate(content.parts):
+                if hasattr(part, 'text') and part.text:
+                    text = part.text
+                    self.llm_logger.info(f"[Part {j+1} - TEXT ({len(text)} chars)]")
+                    self.llm_logger.info(text)
+                
+                elif hasattr(part, 'function_call') and part.function_call:
+                    fc = part.function_call
+                    self.llm_logger.info(f"[Part {j+1} - FUNCTION_CALL]")
+                    self.llm_logger.info(f"  Function: {fc.name}")
+                    self.llm_logger.info(f"  Args: {json.dumps(dict(fc.args) if fc.args else {}, indent=2)}")
+                
+                else:
+                    self.llm_logger.info(f"[Part {j+1} - {type(part).__name__}]")
+        
+        # Log finish reason if available
+        if hasattr(response.candidates[0], 'finish_reason'):
+            self.llm_logger.info(f"\nFinish Reason: {response.candidates[0].finish_reason}")
     
     def thinking(self, thought: str):
         """Log agent's reasoning/thinking."""
@@ -327,7 +650,9 @@ Vision Frames: {self.vision_dir if SAVE_VISION_FRAMES else 'Disabled'}
     
     def api_call(self, direction: str, details: str = ""):
         """Log API calls to Gemini."""
-        self.api_call_count += 1
+        # Only count actual requests, not responses
+        if direction == "REQUEST":
+            self.api_call_count += 1
         self._format_and_log(
             "API",
             f"GEMINI #{self.api_call_count}",
@@ -392,90 +717,54 @@ def debug_print(msg: str):
 # System Prompt for the VR Agent
 # ============================================================================
 
-SYSTEM_PROMPT = """You are an intelligent VR Agent that controls a virtual reality headset and two controllers through an MCP server. You can see what the VR headset sees, move around, and interact with the virtual environment.
+SYSTEM_PROMPT = """You are an intelligent VR Agent that controls a virtual reality headset and two controllers through an MCP server.
 
-## Your Capabilities
+## CRITICAL: Be Efficient with API Calls
+- **DO NOT** use vision tools for simple movement commands (move, turn, look)
+- **ONLY** use vision when explicitly asked to "look", "see", "observe", or when you need to find something
+- For simple commands like "move back", "turn left", "go forward" - just execute the movement directly in ONE call
+- Avoid verification steps unless the task requires visual confirmation
 
-### Devices You Control
-- **Headset**: The VR display/camera - controls what you see and your position in VR space
-- **Controller1**: Left hand controller - for interactions on the left side
-- **Controller2**: Right hand controller - for interactions on the right side
+## Devices You Control
+- **Headset**: VR display/camera - your position in VR space
+- **Controller1**: Left hand controller
+- **Controller2**: Right hand controller
 
-### Movement & Navigation
-You have multiple ways to move in VR. **Choose the right method based on the game/application:**
+## Movement Methods
 
-1. **Direct Position Movement** (teleport/walk_path/move_relative):
-   - Moves the actual position of devices in 3D space
-   - Best for: Applications without locomotion systems, debugging, precise positioning
-   - Use `teleport` for instant movement, `walk_path` for smooth transitions
+### Direct Position Movement (DEFAULT for simple commands)
+- `move_relative`: Move relative to current position - USE THIS for "move back/forward/left/right"
+- `teleport`: Instant move to exact coordinates
+- `walk_path`: Smooth walking to destination
 
-2. **Joystick-Based Locomotion** (set_joystick/move_joystick_direction):
-   - Uses the controller joystick to trigger in-game movement
-   - Best for: Most VR games with smooth locomotion (walking, running)
-   - Typically: Left joystick = movement, Right joystick = turning
-   - Push joystick forward (y=1.0) to walk forward in-game
+### Joystick Locomotion (for VR games with locomotion systems)
+- `move_joystick_direction`: Push joystick in a direction
+- Only use if you know the app uses joystick locomotion
 
-3. **Teleportation (In-Game)**:
-   - Many VR games use controller pointing + trigger for teleport
-   - Point controller at destination, press trigger to teleport
-   - Use `rotate_device` on controller to aim, then `click_button` trigger
-
-**IMPORTANT**: Always consider what type of movement the current VR application expects:
-- Some games ONLY support joystick locomotion
-- Some games ONLY support teleportation
-- Some support both
-- If unsure, try joystick first, then teleportation
-
-### Controller Inputs
-- **Buttons**: trigger, grip, menu, system, trackpad, a, b
-- **Analog**: trigger value (0-1), joystick X/Y (-1 to 1)
-- **Actions**: grab (grip+trigger), release
-
-### Vision
-- `inspect_surroundings`: Capture current view as image
-- `capture_video`: Record a sequence of frames
-- `look_around_and_observe`: 360° panoramic scan
-
-## Planning & Execution Strategy
-
-When given a task, follow this approach:
-
-### 1. UNDERSTAND
-- What is the goal?
-- What game/application are we in? (affects movement method)
-- What information do I need?
-
-### 2. OBSERVE
-- Use vision tools to see the current state
-- Identify relevant objects, UI elements, obstacles
-- Note positions and orientations
-
-### 3. PLAN
-- Break the task into discrete steps
-- Choose appropriate movement method for this application
-- Identify verification points
-
-### 4. EXECUTE & VERIFY
-- Execute one step at a time
-- After each significant action, verify with vision
-- Adjust plan if needed based on observations
-
-### 5. CONFIRM
-- Verify the task is complete
-- Report results to user
+## Simple Command Mappings
+- "move back" → `move_relative(device="headset", dz=1)` (positive Z = backward)
+- "move forward" → `move_relative(device="headset", dz=-1)` (negative Z = forward)
+- "move left" → `move_relative(device="headset", dx=-1)`
+- "move right" → `move_relative(device="headset", dx=1)`
+- "turn left" → `rotate_device(device="headset", yaw=-45, pitch=0, roll=0)`
+- "turn right" → `rotate_device(device="headset", yaw=45, pitch=0, roll=0)`
+- "look up" → `rotate_device(device="headset", pitch=-20, yaw=0, roll=0)`
+- "look down" → `rotate_device(device="headset", pitch=20, yaw=0, roll=0)`
 
 ## Coordinate System
 - X: Left (-) / Right (+)
 - Y: Down (-) / Up (+)  
 - Z: Forward (-) / Backward (+)
-- Rotation: Pitch (up/down), Yaw (left/right), Roll (tilt)
 
-## Important Notes
+## When to Use Vision
+- User asks "what do you see?" or "look around"
+- User asks to find or locate something
+- User asks to interact with a specific object you need to identify
+- **NOT** for simple movement commands
 
-- Controllers are tethered to headset (max 0.8m reach) - they move with you
-- Always verify actions with vision when possible
-- If something doesn't work, try alternative approaches
-- Report what you see and your reasoning to the user
+## Controller Inputs
+- Buttons: trigger, grip, menu, system, trackpad, a, b
+- Analog: trigger value (0-1), joystick X/Y (-1 to 1)
 """
 
 # ============================================================================
@@ -483,17 +772,17 @@ When given a task, follow this approach:
 # ============================================================================
 
 MCP_TOOLS_DEFINITIONS = [
-    # Connection
-    {
-        "name": "start_vr_bridge",
-        "description": "Start the TCP server to listen for the OpenVR driver. Call this first before any other actions.",
-        "parameters": {"type": "object", "properties": {}, "required": []}
-    },
-    {
-        "name": "get_connection_status", 
-        "description": "Check if the VR driver is connected to SteamVR.",
-        "parameters": {"type": "object", "properties": {}, "required": []}
-    },
+    # # Connection
+    # {
+    #     "name": "start_vr_bridge",
+    #     "description": "Start the TCP server to listen for the OpenVR driver. Call this first before any other actions.",
+    #     "parameters": {"type": "object", "properties": {}, "required": []}
+    # },
+    # {
+    #     "name": "get_connection_status", 
+    #     "description": "Check if the VR driver is connected to SteamVR.",
+    #     "parameters": {"type": "object", "properties": {}, "required": []}
+    # },
     
     # Movement
     {
@@ -810,16 +1099,17 @@ class GeminiVRAgent:
         
         # Get API key
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable not set")
         
         debug_print(f"API key found (length: {len(api_key)})")
         
         # Initialize based on SDK version
-        if USE_NEW_SDK:
-            self._init_new_sdk(api_key)
-        else:
-            self._init_old_sdk(api_key)
+        # if USE_NEW_SDK:
+        self._init_new_sdk(api_key)
+        # else:
+        #     self._init_old_sdk(api_key)
         
         # Initialize MCP executor
         debug_print("Initializing MCP executor...")
@@ -840,8 +1130,16 @@ class GeminiVRAgent:
         debug_print("Configuring new google-genai SDK...")
         
         try:
-            self.client = genai.Client(api_key=api_key)
-            debug_print(f"Client created: {type(self.client)}")
+            # Use v1alpha API version for media_resolution support
+            # Add timeout to prevent hanging on slow responses
+            self.client = genai.Client(
+                api_key=api_key,
+                http_options={
+                    'api_version': 'v1alpha',
+                    'timeout': API_TIMEOUT_MS,
+                }
+            )
+            debug_print(f"Client created: {type(self.client)} with v1alpha API and {API_TIMEOUT_MS/1000}s timeout")
             
             # Build function declarations for the new SDK
             self.tools = self._build_tools_new_sdk()
@@ -894,8 +1192,11 @@ class GeminiVRAgent:
         
         return tools
     
-    def _execute_function_call(self, function_name: str, function_args: Dict) -> str:
-        """Execute a function call and return the result."""
+    def _execute_function_call(self, function_name: str, function_args: Dict) -> tuple:
+        """
+        Execute a function call and return the result.
+        Returns: (result_text, image_parts) where image_parts is a list of image Part objects for Gemini
+        """
         logger = get_logger()
         
         # Execute the tool
@@ -911,7 +1212,104 @@ class GeminiVRAgent:
             "result": result[:500] if len(result) > 500 else result
         })
         
-        return result
+        # Extract images from vision tool results for Gemini
+        image_parts = self._extract_images_from_result(function_name, result)
+        
+        return result, image_parts
+    
+    def _extract_images_from_result(self, function_name: str, result: str) -> list:
+        """
+        Extract base64 images from vision tool results and convert to Gemini image parts.
+        Returns a list of (description, types.Part) tuples using the new Gemini 3 API format.
+        Uses inline_data with types.Blob and media_resolution for optimal quality.
+        """
+        image_parts = []
+        
+        # Only process vision-related tools
+        vision_tools = ["inspect_surroundings", "capture_video", "look_around_and_observe"]
+        if function_name not in vision_tools:
+            return image_parts
+        
+        try:
+            result_data = json.loads(result)
+            if not isinstance(result_data, dict):
+                return image_parts
+            
+            result_type = result_data.get('type', '')
+            
+            # Determine media resolution based on content type
+            # For still images: use high resolution for best quality
+            # For video frames: use medium (treated as 70 tokens per frame)
+            is_video = result_type == 'video'
+            resolution_level = "media_resolution_medium" if is_video else "media_resolution_high"
+            
+            # Handle panorama scan (look_around_and_observe) - multiple directions
+            if result_type == 'panorama_scan' and 'directions' in result_data:
+                for direction in result_data['directions']:
+                    angle = direction.get('angle', 0)
+                    b64_data = direction.get('data')
+                    if b64_data:
+                        try:
+                            img_bytes = base64.b64decode(b64_data)
+                            # Use new Gemini 3 API format with inline_data and media_resolution
+                            image_part = types.Part(
+                                inline_data=types.Blob(
+                                    mime_type="image/jpeg",
+                                    data=img_bytes,
+                                ),
+                                media_resolution={"level": resolution_level}
+                            )
+                            image_parts.append((f"View at {angle}°", image_part))
+                        except Exception as e:
+                            debug_print(f"Failed to decode image at angle {angle}: {e}")
+            
+            # Handle video (capture_video) - multiple frames
+            elif result_type == 'video' and 'frames' in result_data:
+                frames = result_data['frames']
+                # Only send a subset of frames to avoid overwhelming the model
+                max_frames = min(5, len(frames))
+                step = max(1, len(frames) // max_frames)
+                for i in range(0, len(frames), step):
+                    if len(image_parts) >= max_frames:
+                        break
+                    b64_data = frames[i]
+                    try:
+                        img_bytes = base64.b64decode(b64_data)
+                        # Use medium resolution for video frames (70 tokens per frame)
+                        image_part = types.Part(
+                            inline_data=types.Blob(
+                                mime_type="image/jpeg",
+                                data=img_bytes,
+                            ),
+                            media_resolution={"level": "media_resolution_medium"}
+                        )
+                        image_parts.append((f"Frame {i+1}", image_part))
+                    except Exception as e:
+                        debug_print(f"Failed to decode video frame {i}: {e}")
+            
+            # Handle single image (inspect_surroundings)
+            elif result_type == 'image' and 'data' in result_data:
+                b64_data = result_data['data']
+                try:
+                    img_bytes = base64.b64decode(b64_data)
+                    # Use high resolution for single images (1120 tokens)
+                    image_part = types.Part(
+                        inline_data=types.Blob(
+                            mime_type="image/jpeg",
+                            data=img_bytes,
+                        ),
+                        media_resolution={"level": "media_resolution_high"}
+                    )
+                    image_parts.append(("Current view", image_part))
+                except Exception as e:
+                    debug_print(f"Failed to decode image: {e}")
+            
+        except json.JSONDecodeError:
+            pass
+        except Exception as e:
+            debug_print(f"Error extracting images: {e}")
+        
+        return image_parts
     
     def execute_task(self, task: str, max_iterations: int = 20) -> str:
         """
@@ -935,13 +1333,8 @@ class GeminiVRAgent:
         
         prompt = f"""Execute this VR task: {task}
 
-First, observe the current state using vision tools if needed, then plan your approach, and execute step by step. Verify each significant action.
-
-Remember:
-- For in-game movement, use joystick (controller1 for locomotion, controller2 for turning)
-- For direct positioning, use teleport/walk_path
-- Always verify with vision after important actions
-- Report what you see and your reasoning"""
+Be efficient - for simple movement commands, just execute the action directly without checking status or using vision.
+Only use vision tools if the task requires seeing something."""
 
         try:
             # Create tool config
@@ -965,17 +1358,25 @@ Remember:
                 rate_limiter.acquire(logger)
                 
                 try:
+                    # Log the full request to LLM conversation log
+                    logger.log_llm_request(contents, iteration)
+                    
                     # Generate response
+                    # Note: Gemini 3 recommends temperature=1.0 (default) for optimal reasoning
                     logger.api_call("REQUEST", f"Sending to {self.model_name} (RPM: {rate_limiter.get_current_rpm()}/{rate_limiter.max_rpm})")
                     response = self.client.models.generate_content(
                         model=self.model_name,
                         contents=contents,
                         config=types.GenerateContentConfig(
                             tools=[tool_config],
-                            temperature=0.7,
+                            temperature=1.0,  # Gemini 3 optimal - don't change!
+                            max_output_tokens=MAX_OUTPUT_TOKENS,
                         )
                     )
                     logger.api_call("RESPONSE", "Received from Gemini")
+                    
+                    # Log the full response to LLM conversation log
+                    logger.log_llm_response(response, iteration)
                 finally:
                     rate_limiter.release()
                 
@@ -989,20 +1390,49 @@ Remember:
                             has_function_call = True
                             fc = part.function_call
                             
-                            # Execute the function
+                            # Execute the function and get any images
                             args = dict(fc.args) if fc.args else {}
-                            result = self._execute_function_call(fc.name, args)
+                            result, image_parts = self._execute_function_call(fc.name, args)
                             
-                            # Add assistant response and function result to contents
+                            # Add assistant response to contents
                             contents.append(candidate.content)
-                            contents.append(types.Content(
-                                role="user",
-                                parts=[types.Part(
+                            
+                            # Build the function response parts
+                            # For vision tools, include a simplified text result + actual images
+                            response_parts = []
+                            
+                            if image_parts:
+                                # For vision results, send a brief text description + actual images
+                                # This allows Gemini to actually SEE the images
+                                num_images = len(image_parts)
+                                image_descriptions = [desc for desc, _ in image_parts]
+                                
+                                response_parts.append(types.Part(
+                                    function_response=types.FunctionResponse(
+                                        name=fc.name,
+                                        response={
+                                            "status": "success",
+                                            "message": f"Captured {num_images} image(s): {', '.join(image_descriptions)}. The images are provided below for your analysis."
+                                        }
+                                    )
+                                ))
+                                
+                                # Add each image as a separate part with a label
+                                for desc, img_part in image_parts:
+                                    response_parts.append(types.Part(text=f"\n[Image: {desc}]"))
+                                    response_parts.append(img_part)
+                            else:
+                                # Non-vision tool, just return the text result
+                                response_parts.append(types.Part(
                                     function_response=types.FunctionResponse(
                                         name=fc.name,
                                         response={"result": result}
                                     )
-                                )]
+                                ))
+                            
+                            contents.append(types.Content(
+                                role="user",
+                                parts=response_parts
                             ))
                             break
                         
@@ -1124,16 +1554,20 @@ def main():
     print("Gemini VR Agent")
     print("="*60)
     
-    # Check for API key
+    # Check for API key (loaded from .env or system environment)
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("\nError: GEMINI_API_KEY environment variable not set.")
-        print("Get your API key from: https://aistudio.google.com/app/apikey")
-        print("\nSet it with:")
+        print("\nError: GEMINI_API_KEY not found.")
+        print("\nOption 1 - Create a .env file in this directory:")
+        print("  GEMINI_API_KEY=your_key_here")
+        print("\nOption 2 - Set environment variable:")
         print("  Windows CMD: set GEMINI_API_KEY=your_key_here")
         print("  Windows PowerShell: $env:GEMINI_API_KEY='your_key_here'")
         print("  Linux/Mac: export GEMINI_API_KEY=your_key_here")
+        print("\nGet your API key from: https://aistudio.google.com/app/apikey")
         return
+    
+    print(f"API key loaded (length: {len(api_key)})")
     
     try:
         debug_print("Creating agent...")
