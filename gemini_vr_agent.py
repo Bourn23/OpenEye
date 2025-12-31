@@ -15,8 +15,13 @@ import json
 import time
 import base64
 import traceback
+import logging
+import threading
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
+from pathlib import Path
+from collections import deque
 
 # Try the new google-genai package first, fall back to deprecated one
 try:
@@ -39,11 +44,349 @@ except ImportError:
 
 GEMINI_MODEL = "gemini-3-flash-preview"  # or "gemini-1.5-pro" for better reasoning
 DEBUG = True  # Enable debug output
+LOG_DIR = Path("agent_logs")  # Directory for log files
+SAVE_VISION_FRAMES = True  # Save captured images to disk for inspection
+
+# Rate limiting configuration
+MAX_REQUESTS_PER_MINUTE = 35  # Stay under 40 RPM limit with buffer
+MIN_REQUEST_INTERVAL = 2.0  # Minimum seconds between requests (spreads out calls)
+MAX_CONCURRENT_REQUESTS = 6  # Stay under 8 concurrent limit with buffer
+
+# ============================================================================
+# Rate Limiter
+# ============================================================================
+
+class RateLimiter:
+    """
+    Rate limiter for API calls with RPM tracking and automatic delays.
+    Thread-safe implementation.
+    """
+    
+    def __init__(
+        self,
+        max_rpm: int = MAX_REQUESTS_PER_MINUTE,
+        min_interval: float = MIN_REQUEST_INTERVAL,
+        max_concurrent: int = MAX_CONCURRENT_REQUESTS
+    ):
+        self.max_rpm = max_rpm
+        self.min_interval = min_interval
+        self.max_concurrent = max_concurrent
+        
+        # Track request timestamps (last 60 seconds)
+        self.request_times: deque = deque()
+        self.last_request_time: float = 0
+        self.active_requests: int = 0
+        
+        # Thread safety
+        self._lock = threading.Lock()
+        
+        # Stats
+        self.total_requests = 0
+        self.total_wait_time = 0.0
+    
+    def _cleanup_old_requests(self):
+        """Remove request timestamps older than 60 seconds."""
+        now = time.time()
+        while self.request_times and (now - self.request_times[0]) > 60:
+            self.request_times.popleft()
+    
+    def get_current_rpm(self) -> int:
+        """Get current requests per minute."""
+        with self._lock:
+            self._cleanup_old_requests()
+            return len(self.request_times)
+    
+    def wait_if_needed(self, logger: 'AgentLogger' = None) -> float:
+        """
+        Wait if necessary to respect rate limits.
+        Returns the time waited in seconds.
+        """
+        wait_time = 0.0
+        
+        with self._lock:
+            now = time.time()
+            self._cleanup_old_requests()
+            
+            # Check 1: Minimum interval between requests
+            time_since_last = now - self.last_request_time
+            if time_since_last < self.min_interval:
+                interval_wait = self.min_interval - time_since_last
+                wait_time = max(wait_time, interval_wait)
+            
+            # Check 2: RPM limit
+            current_rpm = len(self.request_times)
+            if current_rpm >= self.max_rpm:
+                # Wait until oldest request falls out of the 60s window
+                oldest = self.request_times[0]
+                rpm_wait = 60 - (now - oldest) + 0.1  # +0.1s buffer
+                wait_time = max(wait_time, rpm_wait)
+            
+            # Check 3: Concurrent request limit
+            if self.active_requests >= self.max_concurrent:
+                # This shouldn't happen in single-threaded use, but safety first
+                wait_time = max(wait_time, 1.0)
+        
+        # Actually wait (outside lock)
+        if wait_time > 0:
+            if logger:
+                logger.info(
+                    f"Rate limit: waiting {wait_time:.1f}s "
+                    f"(RPM: {self.get_current_rpm()}/{self.max_rpm})"
+                )
+            time.sleep(wait_time)
+            self.total_wait_time += wait_time
+        
+        return wait_time
+    
+    def acquire(self, logger: 'AgentLogger' = None):
+        """Acquire permission to make a request. Blocks if rate limited."""
+        self.wait_if_needed(logger)
+        
+        with self._lock:
+            now = time.time()
+            self.request_times.append(now)
+            self.last_request_time = now
+            self.active_requests += 1
+            self.total_requests += 1
+    
+    def release(self):
+        """Release after request completes."""
+        with self._lock:
+            self.active_requests = max(0, self.active_requests - 1)
+    
+    def get_stats(self) -> Dict:
+        """Get rate limiter statistics."""
+        return {
+            "total_requests": self.total_requests,
+            "current_rpm": self.get_current_rpm(),
+            "max_rpm": self.max_rpm,
+            "total_wait_time_seconds": round(self.total_wait_time, 2),
+            "active_requests": self.active_requests
+        }
+
+
+# Global rate limiter instance
+_rate_limiter: Optional[RateLimiter] = None
+
+def get_rate_limiter() -> RateLimiter:
+    """Get or create the global rate limiter."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        _rate_limiter = RateLimiter()
+    return _rate_limiter
+
+# ============================================================================
+# Structured Logger
+# ============================================================================
+
+class AgentLogger:
+    """
+    Structured logger for VR Agent debugging.
+    Outputs to both console and file with clear formatting.
+    """
+    
+    def __init__(self, log_dir: Path = LOG_DIR):
+        self.log_dir = log_dir
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Create session-specific log file
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = self.log_dir / f"agent_session_{self.session_id}.log"
+        self.vision_dir = self.log_dir / f"vision_{self.session_id}"
+        
+        if SAVE_VISION_FRAMES:
+            self.vision_dir.mkdir(exist_ok=True)
+        
+        # Setup file logger
+        self.file_logger = logging.getLogger(f"vr_agent_{self.session_id}")
+        self.file_logger.setLevel(logging.DEBUG)
+        
+        file_handler = logging.FileHandler(self.log_file, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+        self.file_logger.addHandler(file_handler)
+        
+        # Counters
+        self.action_count = 0
+        self.vision_frame_count = 0
+        self.api_call_count = 0
+        
+        self._log_header()
+    
+    def _log_header(self):
+        """Log session header."""
+        header = f"""
+{'='*70}
+VR AGENT SESSION: {self.session_id}
+Started: {datetime.now().isoformat()}
+Log File: {self.log_file}
+Vision Frames: {self.vision_dir if SAVE_VISION_FRAMES else 'Disabled'}
+{'='*70}
+"""
+        print(header)
+        self.file_logger.info(header)
+    
+    def _format_and_log(self, level: str, category: str, message: str, data: Dict = None):
+        """Format and output log entry."""
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        
+        # Build log line
+        prefix = f"[{timestamp}] [{level}] [{category}]"
+        log_line = f"{prefix} {message}"
+        
+        # Console output with colors (ANSI)
+        colors = {
+            "INFO": "\033[94m",      # Blue
+            "ACTION": "\033[92m",    # Green
+            "VISION": "\033[95m",    # Magenta
+            "THINK": "\033[93m",     # Yellow
+            "ERROR": "\033[91m",     # Red
+            "API": "\033[96m",       # Cyan
+        }
+        reset = "\033[0m"
+        color = colors.get(level, "")
+        
+        print(f"{color}{log_line}{reset}")
+        
+        # Add data if present
+        if data:
+            data_str = json.dumps(data, indent=2, default=str)
+            # Truncate large data for console
+            if len(data_str) > 500:
+                print(f"  └─ Data: {data_str[:500]}... (truncated)")
+            else:
+                for line in data_str.split('\n'):
+                    print(f"  │ {line}")
+        
+        # File output (full data)
+        self.file_logger.info(log_line)
+        if data:
+            self.file_logger.info(f"  DATA: {json.dumps(data, default=str)}")
+    
+    def info(self, message: str, data: Dict = None):
+        """General info log."""
+        self._format_and_log("INFO", "SYSTEM", message, data)
+    
+    def action(self, tool_name: str, args: Dict, result: str):
+        """Log a tool/action execution."""
+        self.action_count += 1
+        
+        # Detect vision-related actions
+        is_vision = tool_name in ["inspect_surroundings", "capture_video", "look_around_and_observe"]
+        
+        self._format_and_log(
+            "ACTION", 
+            f"TOOL #{self.action_count}",
+            f"{tool_name}",
+            {"arguments": args}
+        )
+        
+        # Handle vision results specially
+        if is_vision and "base64" in result.lower():
+            self._handle_vision_result(tool_name, result)
+        else:
+            # Truncate long results for display
+            display_result = result[:300] + "..." if len(result) > 300 else result
+            self._format_and_log("ACTION", "RESULT", display_result)
+    
+    def _handle_vision_result(self, tool_name: str, result: str):
+        """Handle and optionally save vision data."""
+        self.vision_frame_count += 1
+        
+        # Try to extract and save base64 image
+        if SAVE_VISION_FRAMES:
+            try:
+                # Look for base64 data in result
+                import re
+                b64_match = re.search(r'[A-Za-z0-9+/=]{100,}', result)
+                if b64_match:
+                    b64_data = b64_match.group(0)
+                    img_data = base64.b64decode(b64_data)
+                    
+                    frame_path = self.vision_dir / f"frame_{self.vision_frame_count:04d}_{tool_name}.jpg"
+                    frame_path.write_bytes(img_data)
+                    
+                    self._format_and_log(
+                        "VISION",
+                        f"FRAME #{self.vision_frame_count}",
+                        f"Saved to: {frame_path}",
+                        {"size_bytes": len(img_data)}
+                    )
+                else:
+                    self._format_and_log("VISION", "CAPTURE", f"Vision data received ({len(result)} chars)")
+            except Exception as e:
+                self._format_and_log("VISION", "CAPTURE", f"Vision data received (save failed: {e})")
+        else:
+            self._format_and_log("VISION", "CAPTURE", f"Vision data received ({len(result)} chars)")
+    
+    def thinking(self, thought: str):
+        """Log agent's reasoning/thinking."""
+        # Clean up and format thought
+        thought = thought.strip()
+        if thought:
+            self._format_and_log("THINK", "REASONING", thought[:500] + ("..." if len(thought) > 500 else ""))
+    
+    def api_call(self, direction: str, details: str = ""):
+        """Log API calls to Gemini."""
+        self.api_call_count += 1
+        self._format_and_log(
+            "API",
+            f"GEMINI #{self.api_call_count}",
+            f"{direction} {details}"
+        )
+    
+    def error(self, message: str, exception: Exception = None):
+        """Log errors."""
+        self._format_and_log("ERROR", "ERROR", message)
+        if exception:
+            self.file_logger.error(traceback.format_exc())
+    
+    def task_start(self, task: str):
+        """Log task start."""
+        separator = "=" * 70
+        msg = f"\n{separator}\nNEW TASK: {task}\n{separator}"
+        print(f"\033[1m{msg}\033[0m")  # Bold
+        self.file_logger.info(msg)
+    
+    def task_complete(self, actions_taken: int, summary: str = ""):
+        """Log task completion."""
+        separator = "=" * 70
+        msg = f"""
+{separator}
+TASK COMPLETE
+  Actions: {actions_taken}
+  API Calls: {self.api_call_count}
+  Vision Frames: {self.vision_frame_count}
+{separator}
+"""
+        print(f"\033[1;92m{msg}\033[0m")  # Bold green
+        self.file_logger.info(msg)
+        if summary:
+            self.file_logger.info(f"Summary: {summary}")
+    
+    def state_update(self, device: str, position: Dict = None, rotation: Dict = None):
+        """Log device state changes."""
+        data = {}
+        if position:
+            data["position"] = position
+        if rotation:
+            data["rotation"] = rotation
+        self._format_and_log("INFO", f"STATE:{device.upper()}", "Pose updated", data)
+
+
+# Global logger instance
+_logger: Optional[AgentLogger] = None
+
+def get_logger() -> AgentLogger:
+    """Get or create the global logger."""
+    global _logger
+    if _logger is None:
+        _logger = AgentLogger()
+    return _logger
 
 def debug_print(msg: str):
     """Print debug message if debugging is enabled."""
     if DEBUG:
-        print(f"[DEBUG] {msg}")
+        get_logger().info(msg)
 
 # ============================================================================
 # System Prompt for the VR Agent
@@ -355,30 +698,6 @@ MCP_TOOLS_DEFINITIONS = [
         }
     },
     
-    # Actions
-    {
-        "name": "perform_grab",
-        "description": "Grab action - press grip and trigger together. Use to pick up objects.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "controller": {"type": "string", "enum": ["controller1", "controller2"]}
-            },
-            "required": ["controller"]
-        }
-    },
-    {
-        "name": "perform_release",
-        "description": "Release a grabbed object.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "controller": {"type": "string", "enum": ["controller1", "controller2"]}
-            },
-            "required": ["controller"]
-        }
-    },
-    
     # Vision
     {
         "name": "inspect_surroundings",
@@ -577,10 +896,13 @@ class GeminiVRAgent:
     
     def _execute_function_call(self, function_name: str, function_args: Dict) -> str:
         """Execute a function call and return the result."""
-        print(f"  → Executing: {function_name}({function_args})")
+        logger = get_logger()
         
         # Execute the tool
         result = self.executor.call_tool(function_name, function_args)
+        
+        # Log the action with full details
+        logger.action(function_name, function_args, result)
         
         # Track the action
         self.state.actions_taken.append({
@@ -595,9 +917,8 @@ class GeminiVRAgent:
         """
         Execute a VR task with planning and verification.
         """
-        print(f"\n{'='*60}")
-        print(f"Task: {task}")
-        print(f"{'='*60}\n")
+        logger = get_logger()
+        logger.task_start(task)
         
         # Reset state
         self.state = AgentState(task=task)
@@ -609,7 +930,8 @@ class GeminiVRAgent:
     
     def _execute_task_new_sdk(self, task: str, max_iterations: int) -> str:
         """Execute task using new google-genai SDK."""
-        debug_print("Executing task with new SDK...")
+        logger = get_logger()
+        logger.info("Starting task execution with new SDK")
         
         prompt = f"""Execute this VR task: {task}
 
@@ -636,19 +958,26 @@ Remember:
             iteration = 0
             while iteration < max_iterations:
                 iteration += 1
-                debug_print(f"Iteration {iteration}")
+                logger.info(f"Iteration {iteration}/{max_iterations}")
                 
-                # Generate response
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        tools=[tool_config],
-                        temperature=0.7,
+                # Rate limiting - wait if needed before making API call
+                rate_limiter = get_rate_limiter()
+                rate_limiter.acquire(logger)
+                
+                try:
+                    # Generate response
+                    logger.api_call("REQUEST", f"Sending to {self.model_name} (RPM: {rate_limiter.get_current_rpm()}/{rate_limiter.max_rpm})")
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            tools=[tool_config],
+                            temperature=0.7,
+                        )
                     )
-                )
-                
-                debug_print(f"Response received: {type(response)}")
+                    logger.api_call("RESPONSE", "Received from Gemini")
+                finally:
+                    rate_limiter.release()
                 
                 # Check for function calls
                 has_function_call = False
@@ -679,6 +1008,8 @@ Remember:
                         
                         if hasattr(part, 'text') and part.text:
                             text_response += part.text
+                            # Log the agent's thinking/reasoning
+                            logger.thinking(part.text)
                     
                     if has_function_call:
                         break
@@ -686,21 +1017,24 @@ Remember:
                 if not has_function_call:
                     # No more function calls, we're done
                     self.state.completed = True
-                    print(f"\n{'='*60}")
-                    print(f"Task Complete - {len(self.state.actions_taken)} actions taken")
-                    print(f"{'='*60}\n")
+                    rate_stats = get_rate_limiter().get_stats()
+                    logger.info(f"Rate limiter stats: {rate_stats}")
+                    logger.task_complete(len(self.state.actions_taken), text_response[:200])
                     return text_response
             
+            logger.info(f"Max iterations ({max_iterations}) reached")
+            rate_stats = get_rate_limiter().get_stats()
+            logger.info(f"Rate limiter stats: {rate_stats}")
             return "Max iterations reached"
             
         except Exception as e:
-            debug_print(f"Error during task execution: {e}")
-            traceback.print_exc()
+            logger.error(f"Error during task execution: {e}", e)
             return f"Error: {str(e)}"
     
     def _execute_task_old_sdk(self, task: str, max_iterations: int) -> str:
         """Execute task using deprecated SDK."""
-        debug_print("Executing task with old SDK...")
+        logger = get_logger()
+        logger.info("Executing task with old SDK (limited functionality)")
         
         prompt = f"""Execute this VR task: {task}
 
@@ -708,19 +1042,30 @@ First, observe the current state, then plan your approach, and execute step by s
 
         try:
             self.chat = self.model.start_chat()
-            response = self.chat.send_message(prompt)
+            
+            # Rate limiting
+            rate_limiter = get_rate_limiter()
+            rate_limiter.acquire(logger)
+            
+            try:
+                logger.api_call("REQUEST", "Sending to Gemini (old SDK)")
+                response = self.chat.send_message(prompt)
+                logger.api_call("RESPONSE", "Received from Gemini")
+            finally:
+                rate_limiter.release()
             
             # Simple text response for old SDK (function calling is more complex)
             text = ""
             for part in response.parts:
                 if hasattr(part, 'text'):
                     text += part.text
+                    logger.thinking(part.text)
             
+            logger.task_complete(0, text[:200])
             return text
             
         except Exception as e:
-            debug_print(f"Error: {e}")
-            traceback.print_exc()
+            logger.error(f"Error: {e}", e)
             return f"Error: {str(e)}"
     
     def chat_interactive(self):
