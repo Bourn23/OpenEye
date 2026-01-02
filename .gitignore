@@ -2,9 +2,9 @@
 venv/
 .kiro
 .vs
-
 .env
 
+sam3/
 
 # Images
 *.jpg
